@@ -179,8 +179,10 @@ const receiptDetailsFixture = `{
 	}
 }`
 
-// readGraphQLRequest reads and rewinds the body so the handler can both
-// inspect and decode the request.
+// readGraphQLRequest reads the request body once and returns it both
+// decoded as a graphQLRequest and as the original raw string, so the
+// handler can switch on the query while still asserting on the wire form.
+// It does not rewind r.Body — callers must not read it again.
 func readGraphQLRequest(t *testing.T, r *http.Request) (graphQLRequest, string) {
 	t.Helper()
 	raw, err := io.ReadAll(r.Body)
@@ -272,6 +274,34 @@ func TestConvertPOSIDsBatchShape(t *testing.T) {
 	}
 }
 
+func TestConvertPOSIDsTreatsNullAsUnresolved(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		readGraphQLRequest(t, r)
+		// productConvertId is `Int` (nullable) in the schema. A null
+		// alias must not break the whole batch — it should fall back
+		// to the same "unresolved" path as -1.
+		json.NewEncoder(w).Encode(graphQLResponse[json.RawMessage]{
+			Data: json.RawMessage(`{"p0":171607,"p1":null,"p2":-1}`),
+		})
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL))
+	mapping, err := client.ConvertPOSIDs(context.Background(), []int{767898, 111111, 222222})
+	if err != nil {
+		t.Fatalf("null alias should not produce an error, got: %v", err)
+	}
+	if mapping[767898] != 171607 {
+		t.Errorf("expected 767898 -> 171607, got %d", mapping[767898])
+	}
+	if _, ok := mapping[111111]; ok {
+		t.Errorf("null alias should be omitted from mapping, got %d", mapping[111111])
+	}
+	if _, ok := mapping[222222]; ok {
+		t.Errorf("-1 sentinel should be omitted from mapping, got %d", mapping[222222])
+	}
+}
+
 func TestConvertPOSIDsErrorIsBestEffort(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req, _ := readGraphQLRequest(t, r)
@@ -298,5 +328,18 @@ func TestConvertPOSIDsErrorIsBestEffort(t *testing.T) {
 		if item.WebshopID != 0 {
 			t.Errorf("expected WebshopID=0 on convert failure, got %d for ProductID %d", item.WebshopID, item.ProductID)
 		}
+	}
+
+	// Direct caller of ConvertPOSIDs that ignores err must not panic
+	// or nil-deref on the returned map; it should be safely readable.
+	mapping, err := client.ConvertPOSIDs(context.Background(), []int{1, 2})
+	if err == nil {
+		t.Fatalf("expected error from failing convert call")
+	}
+	if mapping == nil {
+		t.Fatalf("ConvertPOSIDs returned nil map alongside error; should be non-nil for safe lookup")
+	}
+	if v := mapping[1]; v != 0 {
+		t.Errorf("expected 0 lookup on empty map, got %d", v)
 	}
 }

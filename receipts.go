@@ -183,9 +183,11 @@ func (c *Client) GetReceipt(ctx context.Context, id string) (*Receipt, error) {
 // request using aliased subfields, regardless of how many ids are passed.
 //
 // The returned map only contains entries that resolved successfully.
-// Unknown ids and ids for which the API returned -1 (its sentinel for "no
-// conversion exists") are silently omitted, so callers can use a plain
-// `out[id]` lookup with a `0` zero-value meaning "unresolved".
+// Unknown ids, ids for which the API returned its -1 "no conversion"
+// sentinel, and ids whose alias came back null are silently omitted, so
+// callers can use a plain `out[id]` lookup with a `0` zero-value meaning
+// "unresolved". The map is always non-nil (including on error), so it is
+// safe to read from even when the caller chooses to ignore err.
 //
 // Only feed this method ids that actually came from PosReceiptProduct.id.
 // The underlying resolver does not validate the source id space; passing
@@ -223,17 +225,20 @@ func (c *Client) ConvertPOSIDs(ctx context.Context, ids []int) (map[int]int, err
 	}
 	b.WriteString(" }")
 
-	var resp map[string]int
+	// productConvertId is declared as Int (nullable) in the schema —
+	// decode through *int so a null alias becomes a normal "unresolved"
+	// instead of a JSON unmarshal failure that would torch the batch.
+	var resp map[string]*int
 	if err := c.DoGraphQL(ctx, b.String(), nil, &resp); err != nil {
-		return nil, fmt.Errorf("convert pos ids: %w", err)
+		return out, fmt.Errorf("convert pos ids: %w", err)
 	}
 
 	for i, id := range unique {
-		v, ok := resp[fmt.Sprintf("p%d", i)]
-		if !ok || v <= 0 {
+		v := resp[fmt.Sprintf("p%d", i)]
+		if v == nil || *v <= 0 {
 			continue
 		}
-		out[id] = v
+		out[id] = *v
 	}
 	return out, nil
 }

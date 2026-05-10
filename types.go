@@ -299,8 +299,10 @@ type ReceiptItem struct {
 	// see WebshopID for the webshop equivalent.
 	ProductID int `json:"productId,omitempty"`
 	// WebshopID is the AH webshop product id (the "wi<id>" used on
-	// ah.nl), resolved from ProductID via productConvertId. 0 when
-	// resolution failed or the API returned its -1 sentinel.
+	// ah.nl), resolved from ProductID via productConvertId. The
+	// in-memory zero value 0 means resolution failed or the API
+	// returned its -1 sentinel; in JSON, 0 is omitted entirely
+	// (omitempty), so consumers should treat "absent" as "unresolved".
 	WebshopID int `json:"webshopId,omitempty"`
 }
 
