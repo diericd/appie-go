@@ -202,7 +202,14 @@ func (c *Client) setHeaders(req *http.Request) {
 	if c.accessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.accessToken)
 	}
-	if c.orderID != "" {
+	// The active-order header scopes the API to that order's delivery slot and
+	// assortment. Product search must see the full catalog: when an order is
+	// REOPENED it has no valid delivery context, so a scoped search returns zero
+	// results (orderable=forDeliveryLocationOrSample). Skip the header for product
+	// reads (search by query and by ids); keep it for order/basket operations that
+	// genuinely need the active-order context.
+	isProductRead := strings.Contains(req.URL.Path, "/product/search")
+	if c.orderID != "" && !isProductRead {
 		req.Header.Set("appie-current-order-id", c.orderID)
 		if c.orderHash != "" {
 			req.Header.Set("appie-current-order-hash", c.orderHash)
