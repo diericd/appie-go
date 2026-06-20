@@ -256,7 +256,7 @@ func TestOrderDetailsTotals(t *testing.T) {
 
 func TestAddToOrderBySearch(t *testing.T) {
 	var addedItems []struct {
-		ProductID int `json:"productId"`
+		ProductID int `json:"id"`
 		Quantity  int `json:"quantity"`
 	}
 
@@ -281,20 +281,25 @@ func TestAddToOrderBySearch(t *testing.T) {
 				},
 			})
 
-		case r.URL.Path == "/mobile-services/order/v1/items" && r.Method == http.MethodPut:
+		// AddToOrder writes the basket via the basketItemsUpdate GraphQL mutation.
+		case r.URL.Path == "/graphql" && r.Method == http.MethodPost:
 			var body struct {
-				Items []struct {
-					ProductID int `json:"productId"`
-					Quantity  int `json:"quantity"`
-				} `json:"items"`
+				Variables struct {
+					Items []struct {
+						ProductID int `json:"id"`
+						Quantity  int `json:"quantity"`
+					} `json:"items"`
+				} `json:"variables"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Errorf("decode body: %v", err)
 				http.Error(w, "bad request", 400)
 				return
 			}
-			addedItems = body.Items
-			w.WriteHeader(http.StatusOK)
+			addedItems = body.Variables.Items
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
+			})
 
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -304,6 +309,7 @@ func TestAddToOrderBySearch(t *testing.T) {
 	defer srv.Close()
 
 	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	client.SetOrderID(99999) // active order set, so AddToOrder skips the best-effort GetOrder
 	ctx := context.Background()
 
 	// Search → should find 1 product

@@ -173,7 +173,17 @@ func (c *Client) SetOrderID(id int) {
 	c.mu.Unlock()
 }
 
-// AddToOrder adds or updates items in the current order.
+// basketItemsUpdateMutation is the modern GraphQL basket write. It replaces the
+// deprecated REST PUT /mobile-services/order/v1/items, which returns
+// "Server not in order mode" on ah.be accounts. The mobile gql gateway accepts
+// this mutation with the bearer token; quantity 0 removes an item.
+const basketItemsUpdateMutation = `mutation basketItemsUpdate($items: [BasketMutation!]!) {
+  basketItemsUpdate(items: $items) {
+    __typename
+  }
+}`
+
+// AddToOrder adds or updates items in the current order (basket).
 // If an item already exists, its quantity is updated. Set quantity to 0 to remove.
 //
 // Example:
@@ -182,36 +192,34 @@ func (c *Client) SetOrderID(id int) {
 //	    {ProductID: 123456, Quantity: 2},
 //	})
 func (c *Client) AddToOrder(ctx context.Context, items []OrderItem) error {
-	type itemRequest struct {
-		ProductID     int    `json:"productId"`
-		Quantity      int    `json:"quantity"`
-		OriginCode    string `json:"originCode"`
-		Description   string `json:"description"`
-		Strikethrough bool   `json:"strikethrough"`
+	// Ensure the active-order context (appie-current-order-id header) is set.
+	c.mu.RLock()
+	hasOrder := c.orderID != ""
+	c.mu.RUnlock()
+	if !hasOrder {
+		_, _ = c.GetOrder(ctx) // best-effort; mutation may resolve the basket from the token alone
 	}
 
-	// Merge duplicates: the API rejects requests with duplicate product IDs.
+	// Merge duplicates (the API rejects duplicate product IDs) while keeping order.
 	merged := make(map[int]int, len(items))
+	pids := make([]int, 0, len(items))
 	for _, item := range items {
+		if _, ok := merged[item.ProductID]; !ok {
+			pids = append(pids, item.ProductID)
+		}
 		merged[item.ProductID] += item.Quantity
 	}
 
-	reqItems := make([]itemRequest, 0, len(merged))
-	for pid, qty := range merged {
-		reqItems = append(reqItems, itemRequest{
-			ProductID:     pid,
-			Quantity:      qty,
-			OriginCode:    "PRD",
-			Description:   "",
-			Strikethrough: false,
+	reqItems := make([]map[string]any, 0, len(pids))
+	for _, pid := range pids {
+		reqItems = append(reqItems, map[string]any{
+			"id":       pid,
+			"quantity": merged[pid],
 		})
 	}
 
-	body := map[string]any{
-		"items": reqItems,
-	}
-
-	if err := c.DoRequest(ctx, http.MethodPut, "/mobile-services/order/v1/items?sortBy=DEFAULT", body, nil); err != nil {
+	vars := map[string]any{"items": reqItems}
+	if err := c.DoGraphQL(ctx, basketItemsUpdateMutation, vars, nil); err != nil {
 		return fmt.Errorf("add to order failed: %w", err)
 	}
 
