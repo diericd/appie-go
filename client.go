@@ -64,6 +64,22 @@ func WithBaseURL(url string) Option {
 	}
 }
 
+// WithClientID overrides the API client id (default "appie-ios").
+// Use "appie-be-ios" for Albert Heijn Belgium.
+func WithClientID(id string) Option {
+	return func(c *Client) {
+		c.clientID = id
+	}
+}
+
+// WithLoginBaseURL overrides the OAuth login host (default "https://login.ah.nl").
+// Use "https://login.ah.be" for Albert Heijn Belgium.
+func WithLoginBaseURL(url string) Option {
+	return func(c *Client) {
+		c.loginBaseURL = url
+	}
+}
+
 // WithTokens sets the access and refresh tokens.
 func WithTokens(accessToken, refreshToken string) Option {
 	return func(c *Client) {
