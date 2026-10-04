@@ -27,7 +27,7 @@ go test -tags integration -run TestGetBonusProductsBatch -v -count=1 ./...
 
 ## Architecture
 
-**Client** (`client.go`): Thread-safe HTTP client with mutex-protected token state. Functional options pattern (`WithTokens`, `WithBaseURL`, etc.). Auto-refreshes expired tokens before requests via `ensureFreshToken()`. Core request methods: `doRequest()` (REST) and `doGraphQL()` (GraphQL).
+**Client** (`client.go`): Thread-safe HTTP client with mutex-protected token state. Functional options pattern (`WithTokens`, `WithBaseURL`, etc.). `RefreshIfNeeded()` refreshes a token that expires within a minute before each request, and `DoRequest()` refreshes and retries once on a 401. Core request methods: `DoRequest()` (REST) and `DoGraphQL()` (GraphQL).
 
 **Feature modules** — each file is a self-contained domain:
 - `auth.go` — OAuth login flow, token exchange/refresh, anonymous tokens
