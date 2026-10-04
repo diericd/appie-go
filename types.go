@@ -101,6 +101,9 @@ type Order struct {
 	Hash string `json:"hash,omitempty"`
 	// State is the current order state (e.g., "NEW", "REOPENED").
 	State string `json:"state,omitempty"`
+	// ClosingTime is the deadline for changes, as sent by the API
+	// (e.g. "2026-02-23T22:59:00Z"). Only set by GetOrderDetails.
+	ClosingTime string `json:"closingTime,omitempty"`
 	// Items contains all products in the order.
 	Items []OrderItem `json:"items"`
 	// TotalCount is the number of unique items.
@@ -147,6 +150,39 @@ type OrderSummary struct {
 	TotalPrice    float64 `json:"totalPrice"`
 	TotalDiscount float64 `json:"totalDiscount,omitempty"`
 	DeliveryCost  float64 `json:"deliveryCost,omitempty"`
+}
+
+// BasketWriteResult reports what a basket write actually did, judged by reading
+// the order back. It only covers the product IDs that were sent, so concurrent
+// edits to other lines do not show up.
+type BasketWriteResult struct {
+	// OrderID is the order that was written and read back.
+	OrderID int `json:"order_id"`
+	// Landed lists items sent with qty>0 that are in the order at that qty.
+	Landed []BasketLine `json:"landed,omitempty"`
+	// Rejected lists items sent with qty>0 that are missing from the order.
+	Rejected []int `json:"rejected,omitempty"`
+	// QtyMismatch lists items present at a different qty than sent,
+	// including removals (want 0) that are still there.
+	QtyMismatch []BasketQtyMismatch `json:"qty_mismatch,omitempty"`
+	// Removed lists items sent with qty 0 that are absent from the order.
+	Removed []int `json:"removed,omitempty"`
+	// TotalItems counts the order's distinct product lines, not units.
+	TotalItems int     `json:"total_items"`
+	TotalPrice float64 `json:"total_price"`
+}
+
+// BasketLine is a product ID with its quantity in the order.
+type BasketLine struct {
+	ID  int `json:"id"`
+	Qty int `json:"qty"`
+}
+
+// BasketQtyMismatch is an item whose order quantity differs from the one sent.
+type BasketQtyMismatch struct {
+	ID   int `json:"id"`
+	Want int `json:"want"`
+	Got  int `json:"got"`
 }
 
 // ShoppingList represents a user's shopping list. Users can have multiple lists.
@@ -211,6 +247,8 @@ type Fulfillment struct {
 	OrderID int `json:"orderId"`
 	// Status is the delivery status (e.g., "REOPENED", "SUBMITTED").
 	Status string `json:"status"`
+	// StatusCode is the raw numeric order status.
+	StatusCode int `json:"statusCode"`
 	// StatusDescription is a human-readable status.
 	StatusDescription string `json:"statusDescription"`
 	// ShoppingType is the order type (e.g., "DELIVERY", "PICKUP").
@@ -221,6 +259,13 @@ type Fulfillment struct {
 	TransactionCompleted bool `json:"transactionCompleted"`
 	// Modifiable indicates if items can still be added/changed.
 	Modifiable bool `json:"modifiable"`
+	// Reopenable indicates if the order can be reopened for edits.
+	Reopenable bool `json:"reopenable"`
+	// IsAfterCutOff indicates the closing time has passed.
+	IsAfterCutOff bool `json:"isAfterCutOff"`
+	// ClosingTime is the deadline for changes, as the raw API string
+	// (the schema types it as String, not DateTime).
+	ClosingTime string `json:"closingTime,omitempty"`
 	// Delivery contains delivery slot and address information.
 	Delivery FulfillmentDelivery `json:"delivery"`
 }

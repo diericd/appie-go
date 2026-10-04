@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -357,5 +358,376 @@ func TestGetOrderDetailsNotFound(t *testing.T) {
 	_, err := client.GetOrderDetails(ctx, 999999)
 	if err == nil {
 		t.Fatal("expected error for non-existent order")
+	}
+}
+
+// noRetryDelay zeroes basketReadRetryDelay for the test.
+func noRetryDelay(t *testing.T) {
+	t.Helper()
+	old := basketReadRetryDelay
+	basketReadRetryDelay = 0
+	t.Cleanup(func() { basketReadRetryDelay = old })
+}
+
+func TestAddToOrderChecked(t *testing.T) {
+	noRetryDelay(t)
+
+	summary := func(lines map[int]int) map[string]any {
+		products := make([]map[string]any, 0, len(lines))
+		for id, qty := range lines {
+			products = append(products, map[string]any{
+				"quantity": qty,
+				"product":  map[string]any{"webshopId": id},
+			})
+		}
+		return map[string]any{
+			"id":              777,
+			"state":           "REOPENED",
+			"totalPrice":      map[string]any{"priceTotalPayable": 42.5},
+			"orderedProducts": products,
+		}
+	}
+
+	// 1 lands, 2 is silently rejected by the slot, 3 is capped at 1, 4 is removed,
+	// 5 is untouched and must not appear in the result.
+	before := map[int]int{4: 1, 5: 2}
+	after := map[int]int{1: 2, 3: 1, 5: 2}
+
+	var reads int
+	var sent []map[string]int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/mobile-services/order/v1/summaries/active" && r.Method == http.MethodGet:
+			reads++
+			if reads == 1 {
+				json.NewEncoder(w).Encode(summary(before))
+				return
+			}
+			json.NewEncoder(w).Encode(summary(after))
+		case r.URL.Path == "/graphql" && r.Method == http.MethodPost:
+			var body struct {
+				Variables struct {
+					Items []map[string]int `json:"items"`
+				} `json:"variables"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode body: %v", err)
+			}
+			sent = body.Variables.Items
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	res, err := client.AddToOrderChecked(context.Background(), []OrderItem{
+		{ProductID: 1, Quantity: 1},
+		{ProductID: 1, Quantity: 1}, // duplicates are merged into qty 2
+		{ProductID: 2, Quantity: 1},
+		{ProductID: 3, Quantity: 4},
+		{ProductID: 4, Quantity: 0},
+	})
+	if err != nil {
+		t.Fatalf("AddToOrderChecked: %v", err)
+	}
+
+	if len(sent) != 4 {
+		t.Errorf("sent %d items, want 4 (duplicates merged): %v", len(sent), sent)
+	}
+	// Pre-write read, post-write read, and one retry read because pid 2 is missing.
+	if reads != 3 {
+		t.Errorf("order reads = %d, want 3", reads)
+	}
+
+	want := &BasketWriteResult{
+		OrderID:     777,
+		Landed:      []BasketLine{{ID: 1, Qty: 2}},
+		Rejected:    []int{2},
+		QtyMismatch: []BasketQtyMismatch{{ID: 3, Want: 4, Got: 1}},
+		Removed:     []int{4},
+		TotalItems:  3,
+		TotalPrice:  42.5,
+	}
+	gotJSON, _ := json.Marshal(res)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) {
+		t.Errorf("result mismatch\n got: %s\nwant: %s", gotJSON, wantJSON)
+	}
+}
+
+func TestAddToOrderCheckedNoRetryWhenAllLanded(t *testing.T) {
+	noRetryDelay(t)
+
+	var reads int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/graphql" {
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
+			})
+			return
+		}
+		reads++
+		json.NewEncoder(w).Encode(map[string]any{
+			"id": 777,
+			"orderedProducts": []map[string]any{
+				{"quantity": 1, "product": map[string]any{"webshopId": 9}},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	res, err := client.AddToOrderChecked(context.Background(), []OrderItem{{ProductID: 9, Quantity: 1}})
+	if err != nil {
+		t.Fatalf("AddToOrderChecked: %v", err)
+	}
+	if reads != 2 {
+		t.Errorf("order reads = %d, want 2", reads)
+	}
+	if len(res.Landed) != 1 || len(res.Rejected) != 0 {
+		t.Errorf("unexpected result: %+v", res)
+	}
+}
+
+func TestGetFulfillmentsCutoff(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query string `json:"query"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		for _, field := range []string{"closingDateTime", "isAfterCutOff", "reopenable"} {
+			if !strings.Contains(body.Query, field) {
+				t.Errorf("fulfillments query lacks %s", field)
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"orderFulfillments": map[string]any{"result": []map[string]any{{
+				"orderId":         777,
+				"statusCode":      2,
+				"modifiable":      true,
+				"reopenable":      true,
+				"isAfterCutOff":   false,
+				"closingDateTime": "2026-10-06T22:59:00Z",
+			}}}},
+		})
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	got, err := client.GetFulfillments(context.Background())
+	if err != nil {
+		t.Fatalf("GetFulfillments: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d fulfillments, want 1", len(got))
+	}
+	f := got[0]
+	if f.ClosingTime != "2026-10-06T22:59:00Z" || !f.Reopenable || f.IsAfterCutOff {
+		t.Errorf("cutoff fields not decoded: %+v", f)
+	}
+	if f.StatusCode != 2 {
+		t.Errorf("StatusCode = %d, want 2", f.StatusCode)
+	}
+}
+
+func TestGetOrderDetailsClosingTime(t *testing.T) {
+	data, err := os.ReadFile("testdata/order_details.json")
+	if err != nil {
+		t.Fatalf("read testdata: %v", err)
+	}
+	var resp orderDetailsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := resp.toOrder().ClosingTime; got != "2026-02-23T22:59:00Z" {
+		t.Errorf("ClosingTime = %q, want 2026-02-23T22:59:00Z", got)
+	}
+}
+
+// basketServer serves the active-order summary from reads (one response per
+// read, the last one repeated) and accepts basket mutations, recording the
+// active-order header each mutation carried.
+func basketServer(t *testing.T, orderID int, reads ...map[int]int) (srv *httptest.Server, readCount func() int, mutationOrder func() string) {
+	t.Helper()
+	var n int
+	var header string
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/graphql" {
+			header = r.Header.Get("appie-current-order-id")
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
+			})
+			return
+		}
+		lines := reads[min(n, len(reads)-1)]
+		n++
+		products := make([]map[string]any, 0, len(lines))
+		for id, qty := range lines {
+			products = append(products, map[string]any{"quantity": qty, "product": map[string]any{"webshopId": id}})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": orderID, "orderedProducts": products})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() int { return n }, func() string { return header }
+}
+
+func TestAddToOrderCheckedLaggingBasket(t *testing.T) {
+	noRetryDelay(t)
+	// Pre-write read, read-back without the item, retry with the item.
+	srv, reads, _ := basketServer(t, 777, map[int]int{}, map[int]int{}, map[int]int{9: 1})
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	res, err := client.AddToOrderChecked(context.Background(), []OrderItem{{ProductID: 9, Quantity: 1}})
+	if err != nil {
+		t.Fatalf("AddToOrderChecked: %v", err)
+	}
+	if reads() != 3 {
+		t.Errorf("order reads = %d, want 3", reads())
+	}
+	if len(res.Landed) != 1 || res.Landed[0] != (BasketLine{ID: 9, Qty: 1}) || len(res.Rejected) != 0 {
+		t.Errorf("want 9 landed after the retry, got %+v", res)
+	}
+}
+
+func TestAddToOrderCheckedFromSkipsPreRead(t *testing.T) {
+	noRetryDelay(t)
+	srv, reads, mutationOrder := basketServer(t, 777, map[int]int{9: 1})
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	client.SetOrderID(555) // stale cached order must not receive the write
+	res, err := client.AddToOrderCheckedFrom(context.Background(), &Order{ID: "777"}, []OrderItem{{ProductID: 9, Quantity: 1}})
+	if err != nil {
+		t.Fatalf("AddToOrderCheckedFrom: %v", err)
+	}
+	if reads() != 1 {
+		t.Errorf("order reads = %d, want only the read-back", reads())
+	}
+	if got := mutationOrder(); got != "777" {
+		t.Errorf("mutation sent for order %q, want 777", got)
+	}
+	if res.OrderID != 777 {
+		t.Errorf("OrderID = %d, want 777", res.OrderID)
+	}
+}
+
+func TestAddToOrderCheckedFromOrderChanged(t *testing.T) {
+	noRetryDelay(t)
+	srv, _, _ := basketServer(t, 888, map[int]int{9: 1})
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	_, err := client.AddToOrderCheckedFrom(context.Background(), &Order{ID: "777"}, []OrderItem{{ProductID: 9, Quantity: 1}})
+	if err == nil || !strings.Contains(err.Error(), "888") {
+		t.Fatalf("want an error naming the other active order, got %v", err)
+	}
+}
+
+func TestAddToOrderCheckedReadBackFailure(t *testing.T) {
+	var mutated bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/graphql" {
+			mutated = true
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	_, err := client.AddToOrderCheckedFrom(context.Background(), &Order{ID: "777"}, []OrderItem{{ProductID: 9, Quantity: 1}})
+	if !mutated {
+		t.Fatal("mutation was not sent")
+	}
+	if err == nil || !strings.Contains(err.Error(), "items were sent") || !strings.Contains(err.Error(), "verif") {
+		t.Errorf("error = %v, want it to say the items were sent and only verification failed", err)
+	}
+}
+
+func TestGetFulfillmentsFallsBackOnFieldError(t *testing.T) {
+	var queries []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query string `json:"query"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		queries = append(queries, body.Query)
+		if strings.Contains(body.Query, "reopenable") {
+			json.NewEncoder(w).Encode(map[string]any{
+				"errors": []map[string]any{{"message": `Validation error (FieldUndefined@[orderFulfillments/result/reopenable]) : Field 'reopenable' in type 'OrderFulfillment' is undefined`}},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{"orderFulfillments": map[string]any{"result": []map[string]any{{
+				"orderId":    777,
+				"modifiable": true,
+				"totalPrice": map[string]any{"totalPrice": map[string]any{"amount": 12.5}},
+			}}}},
+		})
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	got, err := client.GetFulfillments(context.Background())
+	if err != nil {
+		t.Fatalf("GetFulfillments: %v", err)
+	}
+	if len(queries) != 2 {
+		t.Fatalf("queries = %d, want the extended query then one fallback", len(queries))
+	}
+	for _, field := range []string{"reopenable", "isAfterCutOff", "closingDateTime"} {
+		if strings.Contains(queries[1], field) {
+			t.Errorf("fallback query still selects %s", field)
+		}
+	}
+	if len(got) != 1 || got[0].OrderID != 777 || !got[0].Modifiable || got[0].TotalPrice != 12.5 {
+		t.Errorf("fallback result = %+v", got)
+	}
+	if got[0].ClosingTime != "" || got[0].Reopenable || got[0].IsAfterCutOff {
+		t.Errorf("new fields must stay empty on fallback: %+v", got[0])
+	}
+}
+
+func TestGetFulfillmentsNoFallbackOnTransportError(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	if _, err := client.GetFulfillments(context.Background()); err == nil {
+		t.Fatal("want an error")
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want no fallback retry on an HTTP error", calls)
+	}
+}
+
+func TestGetFulfillmentsNoFallbackOnOtherGraphQLError(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		json.NewEncoder(w).Encode(map[string]any{
+			"errors": []map[string]any{{"message": "Unauthorized"}},
+		})
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	_, err := client.GetFulfillments(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "Unauthorized") {
+		t.Fatalf("err = %v, want the original GraphQL error", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want no fallback retry on an unrelated GraphQL error", calls)
 	}
 }
