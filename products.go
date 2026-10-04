@@ -231,7 +231,8 @@ func (c *Client) SearchProductsFiltered(ctx context.Context, opts SearchOptions)
 }
 
 // GetProductsByIDs retrieves multiple products by their webshopIds in a single request.
-// Products are returned in the same order as the input IDs.
+// Unknown ids, such as BE web-only products, are left out without an error, so
+// match results to input by Product.ID rather than by position.
 func (c *Client) GetProductsByIDs(ctx context.Context, productIDs []int) ([]Product, error) {
 	if len(productIDs) == 0 {
 		return nil, nil
