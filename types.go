@@ -268,6 +268,10 @@ type graphQLError struct {
 	Path    []any  `json:"path,omitempty"`
 }
 
+func (e graphQLError) Error() string {
+	return "graphql error: " + e.Message
+}
+
 // Receipt represents an in-store purchase receipt (kassabon).
 type Receipt struct {
 	// TransactionID uniquely identifies this receipt.
