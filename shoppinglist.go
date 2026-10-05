@@ -158,16 +158,14 @@ func (c *Client) AddProductToShoppingList(ctx context.Context, productID int, qu
 
 // AddFreeTextToShoppingList adds a free-text item (not linked to a product) to
 // the main shopping list and reports whether a read-back shows it. AH accepts
-// the PATCH even when the line never appears, so only a new free-text line with
-// this name, or a grown quantity on an existing one, counts as verified.
+// the PATCH even when the line never appears, and leaves a re-added line at its
+// quantity, so verified means a free-text line with this name holds at least
+// the requested quantity.
 func (c *Client) AddFreeTextToShoppingList(ctx context.Context, name string, quantity int) (bool, error) {
-	before, err := c.getBoodschappenlijstRaw(ctx)
-	if err != nil {
-		return false, err
-	}
+	quantity = max(quantity, 1)
 	if err := c.AddToShoppingList(ctx, []ListItem{{
 		Name:     name,
-		Quantity: max(quantity, 1),
+		Quantity: quantity,
 	}}); err != nil {
 		return false, err
 	}
@@ -175,10 +173,8 @@ func (c *Client) AddFreeTextToShoppingList(ctx context.Context, name string, qua
 	if err != nil {
 		return false, fmt.Errorf("sent, but read back failed: %w", err)
 	}
-
-	prevQty := freeTextQuantities(before, name)
-	for id, qty := range freeTextQuantities(after, name) {
-		if prev, ok := prevQty[id]; !ok || qty > prev {
+	for _, qty := range freeTextQuantities(after, name) {
+		if qty >= quantity {
 			return true, nil
 		}
 	}

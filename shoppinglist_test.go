@@ -361,32 +361,29 @@ func TestShoppingListToOrderAdditive(t *testing.T) {
 	}
 }
 
-// TestAddFreeTextToShoppingListVerified pins that a free-text add is only
-// verified by a new or grown free-text line, never by a product line that
-// happens to carry the same name.
+// TestAddFreeTextToShoppingListVerified pins that a free-text add is verified
+// when a free-text line with that name holds at least the requested quantity
+// after the add (live AH leaves a re-added line at its quantity), never by a
+// product line that happens to carry the same name.
 func TestAddFreeTextToShoppingListVerified(t *testing.T) {
 	const productSameName = `{"listItemId":1,"quantity":1,"type":"SHOPPABLE","originCode":"PRD",
 		"productDetails":{"product":{"webshopId":111,"title":"AH Halfvolle melk"}}}`
 	const freeText = `{"listItemId":%d,"quantity":%d,"type":"SHOPPABLE","originCode":"PRD","description":"ah halfvolle melk"}`
 	tests := []struct {
-		name   string
-		before string
-		after  string
-		want   bool
+		name  string
+		after string
+		want  bool
 	}{
-		{"new free-text line", `{"items":[` + productSameName + `]}`,
-			`{"items":[` + productSameName + `,` + fmt.Sprintf(freeText, 9, 1) + `]}`, true},
-		{"only a product line with that name", `{"items":[` + productSameName + `]}`,
-			`{"items":[` + productSameName + `]}`, false},
-		{"existing free-text line grew", `{"items":[` + fmt.Sprintf(freeText, 9, 1) + `]}`,
-			`{"items":[` + fmt.Sprintf(freeText, 9, 2) + `]}`, true},
-		{"existing free-text line unchanged", `{"items":[` + fmt.Sprintf(freeText, 9, 1) + `]}`,
-			`{"items":[` + fmt.Sprintf(freeText, 9, 1) + `]}`, false},
+		{"free-text line added", `{"items":[` + productSameName + `,` + fmt.Sprintf(freeText, 9, 1) + `]}`, true},
+		{"only a product line with that name", `{"items":[` + productSameName + `]}`, false},
+		{"free-text line above requested qty", `{"items":[` + fmt.Sprintf(freeText, 9, 2) + `]}`, true},
+		{"existing free-text line re-added", `{"items":[` + fmt.Sprintf(freeText, 9, 1) + `]}`, true},
+		{"free-text line gone after add", `{"items":[]}`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var patches, gql [][]byte
-			srv := boodschappenlijstSeqServer(t, []string{tt.before, tt.after}, emptyOrder, emptyOrder, &patches, &gql)
+			srv := boodschappenlijstSeqServer(t, []string{tt.after}, emptyOrder, emptyOrder, &patches, &gql)
 			defer srv.Close()
 
 			got, err := New(WithBaseURL(srv.URL)).AddFreeTextToShoppingList(context.Background(), "AH Halfvolle melk", 1)
