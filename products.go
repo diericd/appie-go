@@ -3,9 +3,12 @@ package appie
 import (
 	"context"
 	"fmt"
+	"html"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
+	"strings"
 )
 
 // searchResponse matches the API response for product search
@@ -38,6 +41,37 @@ type productResponse struct {
 	IsPreviouslyBought   bool     `json:"isPreviouslyBought"`
 	IsOrderable          bool     `json:"isOrderable"`
 	PropertyIcons        []string `json:"propertyIcons"`
+	// DescriptionHighlights is HTML; kits put "Zelf toevoegen: ..." here.
+	DescriptionHighlights string `json:"descriptionHighlights"`
+}
+
+var (
+	htmlBreak = regexp.MustCompile(`(?i)</p>|</li>|<br\s*/?>|\|\|`)
+	htmlTag   = regexp.MustCompile(`<[^>]*>`)
+)
+
+// descriptionText turns descriptionHighlights HTML into plain lines.
+func descriptionText(s string) string {
+	s = htmlBreak.ReplaceAllString(s, "\n")
+	s = html.UnescapeString(htmlTag.ReplaceAllString(s, ""))
+	var lines []string
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// selfAdd returns what follows "Zelf toevoegen:" on its line, or "".
+func selfAdd(text string) string {
+	const prefix = "zelf toevoegen:"
+	for _, l := range strings.Split(text, "\n") {
+		if strings.HasPrefix(strings.ToLower(l), prefix) {
+			return strings.TrimSpace(l[len(prefix):])
+		}
+	}
+	return ""
 }
 
 // GraphQL query for fetching product nutritional info via tradeItem
@@ -77,7 +111,10 @@ func (p *productResponse) toProduct() Product {
 		price = p.PriceBeforeBonus
 	}
 
+	desc := descriptionText(p.DescriptionHighlights)
 	return Product{
+		ShortDescription:     desc,
+		SelfAdd:              selfAdd(desc),
 		ID:                   p.WebshopID,
 		WebshopID:            strconv.Itoa(p.WebshopID),
 		Title:                p.Title,

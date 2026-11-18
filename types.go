@@ -72,6 +72,8 @@ type Product struct {
 	// Non-empty only for group-level bonus items (e.g., "Alle Hak*") that
 	// have ID==0. Use GetBonusGroupProducts to resolve to individual products.
 	BonusSegmentID string `json:"bonusSegmentId,omitempty"`
+	// SelfAdd is the "Zelf toevoegen" text of a meal kit (what to buy extra).
+	SelfAdd string `json:"selfAdd,omitempty"`
 }
 
 // Price represents product pricing in EUR.
