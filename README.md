@@ -133,7 +133,7 @@ Config is stored at `~/.config/appie/config.json` (or `$XDG_CONFIG_HOME/appie/co
 ## Notes
 
 - Rate limiting may apply. AH does not send back-off headers, so the practical rate limit is unknown.
-- **Server-side state:** Albert Heijn maintains an "active order" on the server, which determines the delivery date context for bonus promo visibility. When you call `ReopenOrder`, that order becomes the active one. Always call `RevertOrder` when done to avoid the account being stuck in a future order with incorrect bonus promos.
+- **Server-side state:** Albert Heijn maintains an "active order" on the server, which determines the delivery date context for bonus promo visibility. When you call `ReopenOrder`, that order becomes the active one until it is checked out. `RevertOrder` restores the pre-reopen order and discards every edit made since the reopen, so call it only to abort.
 
 ## Projects using appie-go
 

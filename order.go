@@ -2,15 +2,19 @@ package appie
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // orderDetailsResponse matches the API response for order details grouped by taxonomy.
 type orderDetailsResponse struct {
 	OrderID      int    `json:"orderId"`
 	OrderState   string `json:"orderState"`
+	ClosingTime  string `json:"closingTime"`
 	DeliveryDate string `json:"deliveryDate"`
 	DeliveryType string `json:"deliveryType"`
 	DeliveryTime struct {
@@ -61,10 +65,11 @@ func (r *orderDetailsResponse) toOrder() Order {
 	}
 
 	return Order{
-		ID:         strconv.Itoa(r.OrderID),
-		State:      r.OrderState,
-		Items:      items,
-		TotalCount: len(items),
+		ID:          strconv.Itoa(r.OrderID),
+		State:       r.OrderState,
+		ClosingTime: r.ClosingTime,
+		Items:       items,
+		TotalCount:  len(items),
 	}
 }
 
@@ -200,21 +205,12 @@ func (c *Client) AddToOrder(ctx context.Context, items []OrderItem) error {
 		_, _ = c.GetOrder(ctx) // best-effort; mutation may resolve the basket from the token alone
 	}
 
-	// Merge duplicates (the API rejects duplicate product IDs) while keeping order.
-	merged := make(map[int]int, len(items))
-	pids := make([]int, 0, len(items))
-	for _, item := range items {
-		if _, ok := merged[item.ProductID]; !ok {
-			pids = append(pids, item.ProductID)
-		}
-		merged[item.ProductID] += item.Quantity
-	}
-
-	reqItems := make([]map[string]any, 0, len(pids))
-	for _, pid := range pids {
+	merged := mergeOrderItems(items)
+	reqItems := make([]map[string]any, 0, len(merged))
+	for _, it := range merged {
 		reqItems = append(reqItems, map[string]any{
-			"id":       pid,
-			"quantity": merged[pid],
+			"id":       it.ProductID,
+			"quantity": it.Quantity,
 		})
 	}
 
@@ -224,6 +220,210 @@ func (c *Client) AddToOrder(ctx context.Context, items []OrderItem) error {
 	}
 
 	return nil
+}
+
+// mergeOrderItems sums the quantities of duplicate product IDs (the API rejects
+// duplicates), keeping first-seen order.
+func mergeOrderItems(items []OrderItem) []OrderItem {
+	idx := make(map[int]int, len(items))
+	merged := make([]OrderItem, 0, len(items))
+	for _, item := range items {
+		if i, ok := idx[item.ProductID]; ok {
+			merged[i].Quantity += item.Quantity
+			continue
+		}
+		idx[item.ProductID] = len(merged)
+		merged = append(merged, OrderItem{ProductID: item.ProductID, Quantity: item.Quantity})
+	}
+	return merged
+}
+
+// basketReadRetryDelay is how long AddToOrderChecked waits before re-reading
+// the order when a sent item is missing, in case the basket lags the mutation.
+var basketReadRetryDelay = 500 * time.Millisecond
+
+// AddToOrderChecked runs AddToOrder and reads the order back to report which
+// items actually landed. The mutation succeeds even when the delivery slot
+// silently rejects an item, so the read-back is the only reliable signal.
+func (c *Client) AddToOrderChecked(ctx context.Context, items []OrderItem) (*BasketWriteResult, error) {
+	before, err := c.GetOrder(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return c.AddToOrderCheckedFrom(ctx, before, items)
+}
+
+// AddToOrderCheckedFrom is AddToOrderChecked for a caller that already read
+// the active order as before. The write targets before's order, and it fails
+// if the read-back shows a different active order.
+func (c *Client) AddToOrderCheckedFrom(ctx context.Context, before *Order, items []OrderItem) (*BasketWriteResult, error) {
+	orderID, err := strconv.Atoi(before.ID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid order id %q: %w", before.ID, err)
+	}
+	c.SetOrderID(orderID)
+	if err := c.AddToOrder(ctx, items); err != nil {
+		return nil, err
+	}
+
+	merged := mergeOrderItems(items)
+	after, err := c.readBack(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if hasMissingItem(merged, after) {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(basketReadRetryDelay):
+		}
+		if after, err = c.readBack(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if after.ID != before.ID {
+		return nil, fmt.Errorf("items were sent to order %s, but the active order is now %s; check both orders", before.ID, after.ID)
+	}
+
+	res := diffBasketWrite(merged, after)
+	res.OrderID = orderID
+	c.markSoldOut(ctx, res)
+	return res, nil
+}
+
+// markSoldOut moves landed items that the slot cannot fill to SoldOut: the
+// order read-back lists them like any other line. A failed lookup only sets
+// AvailabilityError, because the write already happened.
+func (c *Client) markSoldOut(ctx context.Context, res *BasketWriteResult) {
+	unavailable, err := c.GetBasketUnavailable(ctx)
+	if err != nil {
+		res.AvailabilityError = err.Error()
+		return
+	}
+	soldOut := make(map[int]bool, len(unavailable))
+	for _, u := range unavailable {
+		if u.Reason == UnavailableSoldOut {
+			soldOut[u.ProductID] = true
+		}
+	}
+	landed := res.Landed[:0]
+	for _, l := range res.Landed {
+		if soldOut[l.ID] {
+			res.SoldOut = append(res.SoldOut, l.ID)
+			continue
+		}
+		landed = append(landed, l)
+	}
+	res.Landed = landed
+}
+
+// basketAvailabilityQuery reads the basket through the mobile gql gateway,
+// which, unlike the order summary and details, flags lines the slot cannot
+// fill. Field names were found by probing; introspection is disabled.
+const basketAvailabilityQuery = `query BasketAvailability {
+  basket {
+    items {
+      id
+      quantity
+      allocatedQuantity
+      product {
+        title
+        availabilityLabel
+        availability { isOrderable }
+      }
+    }
+  }
+}`
+
+type basketAvailabilityResponse struct {
+	Basket struct {
+		Items []struct {
+			ID                int  `json:"id"`
+			Quantity          int  `json:"quantity"`
+			AllocatedQuantity *int `json:"allocatedQuantity"`
+			Product           struct {
+				Title             string `json:"title"`
+				AvailabilityLabel string `json:"availabilityLabel"`
+				Availability      struct {
+					IsOrderable bool `json:"isOrderable"`
+				} `json:"availability"`
+			} `json:"product"`
+		} `json:"items"`
+	} `json:"basket"`
+}
+
+// GetBasketUnavailable returns the active basket's lines that will not be
+// delivered. A line is unavailable when its product is not orderable. A null
+// allocatedQuantity means AH kept it out of the order (store only); otherwise
+// it is in the order but sold out. Both rules match the AH app on 2026-10-28.
+func (c *Client) GetBasketUnavailable(ctx context.Context) ([]BasketUnavailable, error) {
+	var resp basketAvailabilityResponse
+	if err := c.DoGraphQL(ctx, basketAvailabilityQuery, nil, &resp); err != nil {
+		return nil, fmt.Errorf("get basket availability failed: %w", err)
+	}
+	var out []BasketUnavailable
+	for _, it := range resp.Basket.Items {
+		if it.Product.Availability.IsOrderable {
+			continue
+		}
+		reason := UnavailableSoldOut
+		if it.AllocatedQuantity == nil {
+			reason = UnavailableStoreOnly
+		}
+		out = append(out, BasketUnavailable{
+			ProductID: it.ID,
+			Title:     it.Product.Title,
+			Quantity:  it.Quantity,
+			Reason:    reason,
+			Label:     it.Product.AvailabilityLabel,
+		})
+	}
+	return out, nil
+}
+
+func (c *Client) readBack(ctx context.Context) (*Order, error) {
+	o, err := c.GetOrder(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("items were sent, but reading the order back to verify them failed: %w", err)
+	}
+	return o, nil
+}
+
+func orderQuantities(o *Order) map[int]int {
+	qty := make(map[int]int, len(o.Items))
+	for _, it := range o.Items {
+		qty[it.ProductID] += it.Quantity
+	}
+	return qty
+}
+
+func hasMissingItem(sent []OrderItem, o *Order) bool {
+	qty := orderQuantities(o)
+	for _, it := range sent {
+		if it.Quantity > 0 && qty[it.ProductID] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func diffBasketWrite(sent []OrderItem, o *Order) *BasketWriteResult {
+	qty := orderQuantities(o)
+	res := &BasketWriteResult{TotalItems: len(o.Items), TotalPrice: o.TotalPrice}
+	for _, it := range sent {
+		got := qty[it.ProductID]
+		switch {
+		case got == it.Quantity && got == 0:
+			res.Removed = append(res.Removed, it.ProductID)
+		case got == it.Quantity:
+			res.Landed = append(res.Landed, BasketLine{ID: it.ProductID, Qty: got})
+		case got == 0:
+			res.Rejected = append(res.Rejected, it.ProductID)
+		default:
+			res.QtyMismatch = append(res.QtyMismatch, BasketQtyMismatch{ID: it.ProductID, Want: it.Quantity, Got: got})
+		}
+	}
+	return res
 }
 
 // RemoveFromOrder removes an item from the current order by setting quantity to 0.
@@ -306,8 +506,8 @@ const revertOrderMutation = `mutation OrderRevert($id: Int!) {
   }
 }`
 
-// RevertOrder reverts a reopened order back to its submitted state.
-// Use this after ReopenOrder to deactivate the order as the active one.
+// RevertOrder reverts a reopened order to its pre-reopen submitted state,
+// discarding edits made since ReopenOrder, and clears the active order.
 func (c *Client) RevertOrder(ctx context.Context, orderID int) error {
 	type revertResponse struct {
 		OrderRevert struct {
@@ -335,7 +535,14 @@ func (c *Client) RevertOrder(ctx context.Context, orderID int) error {
 	return nil
 }
 
-const fulfillmentsQuery = `query OrderFulfillments {
+// fulfillmentsCutoffFields come from a 2026-01 schema dump, not a live
+// response, so GetFulfillments retries without them if AH rejects the query.
+const fulfillmentsCutoffFields = `
+      reopenable
+      isAfterCutOff
+      closingDateTime`
+
+const fulfillmentsQueryTemplate = `query OrderFulfillments {
   orderFulfillments(status: OPEN) {
     result {
       orderId
@@ -343,7 +550,7 @@ const fulfillmentsQuery = `query OrderFulfillments {
       statusDescription
       shoppingType
       transactionCompleted
-      modifiable
+      modifiable%s
       totalPrice {
         totalPrice { amount }
       }
@@ -369,6 +576,11 @@ const fulfillmentsQuery = `query OrderFulfillments {
   }
 }`
 
+var (
+	fulfillmentsQuery       = fmt.Sprintf(fulfillmentsQueryTemplate, fulfillmentsCutoffFields)
+	fulfillmentsQueryLegacy = fmt.Sprintf(fulfillmentsQueryTemplate, "")
+)
+
 type fulfillmentsResponse struct {
 	OrderFulfillments struct {
 		Result []fulfillmentResult `json:"result"`
@@ -382,6 +594,9 @@ type fulfillmentResult struct {
 	ShoppingType         string `json:"shoppingType"`
 	TransactionCompleted bool   `json:"transactionCompleted"`
 	Modifiable           bool   `json:"modifiable"`
+	Reopenable           bool   `json:"reopenable"`
+	IsAfterCutOff        bool   `json:"isAfterCutOff"`
+	ClosingDateTime      string `json:"closingDateTime"`
 	TotalPrice           struct {
 		TotalPrice struct {
 			Amount float64 `json:"amount"`
@@ -390,11 +605,31 @@ type fulfillmentResult struct {
 	Delivery FulfillmentDelivery `json:"delivery"`
 }
 
+// isCutoffFieldError reports whether a GraphQL error is AH rejecting the
+// cutoff fields, so other GraphQL errors are not hidden by the fallback.
+func isCutoffFieldError(e graphQLError) bool {
+	msg := strings.ToLower(e.Message)
+	for _, s := range []string{"reopenable", "isaftercutoff", "closingdatetime", "fieldundefined", "validation"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetFulfillments retrieves all open (scheduled) order fulfillments.
 // These are orders that have been submitted and are awaiting delivery.
+// If AH rejects the cutoff fields, Reopenable, IsAfterCutOff and ClosingTime
+// are left empty.
 func (c *Client) GetFulfillments(ctx context.Context) ([]Fulfillment, error) {
 	var resp fulfillmentsResponse
-	if err := c.DoGraphQL(ctx, fulfillmentsQuery, nil, &resp); err != nil {
+	err := c.DoGraphQL(ctx, fulfillmentsQuery, nil, &resp)
+	if gqlErr := (graphQLError{}); errors.As(err, &gqlErr) && isCutoffFieldError(gqlErr) {
+		c.logger.Printf("fulfillments: retrying without cutoff fields: %v", err)
+		resp = fulfillmentsResponse{}
+		err = c.DoGraphQL(ctx, fulfillmentsQueryLegacy, nil, &resp)
+	}
+	if err != nil {
 		return nil, fmt.Errorf("get fulfillments failed: %w", err)
 	}
 
@@ -405,11 +640,15 @@ func (c *Client) GetFulfillments(ctx context.Context) ([]Fulfillment, error) {
 		fulfillments = append(fulfillments, Fulfillment{
 			OrderID:              r.OrderID,
 			Status:               r.Delivery.Status,
+			StatusCode:           r.StatusCode,
 			StatusDescription:    r.StatusDescription,
 			ShoppingType:         r.ShoppingType,
 			TotalPrice:           r.TotalPrice.TotalPrice.Amount,
 			TransactionCompleted: r.TransactionCompleted,
 			Modifiable:           r.Modifiable,
+			Reopenable:           r.Reopenable,
+			IsAfterCutOff:        r.IsAfterCutOff,
+			ClosingTime:          r.ClosingDateTime,
 			Delivery:             r.Delivery,
 		})
 	}

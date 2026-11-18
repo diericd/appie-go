@@ -141,3 +141,45 @@ func TestSearchProductsBonusPagination(t *testing.T) {
 		t.Errorf("unexpected mechanisms: %q, %q, %q", products[0].BonusMechanism, products[1].BonusMechanism, products[2].BonusMechanism)
 	}
 }
+
+func TestGetProductAvailabilityFlags(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"productId":627042,"productCard":{"webshopId":627042,"title":"Kit",
+			"availableOnline":true,"isOrderable":false,"isPreviouslyBought":true,"propertyIcons":["vegetarisch"]}}`)
+	}))
+	defer server.Close()
+
+	p, err := New(WithBaseURL(server.URL)).GetProduct(context.Background(), 627042)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !p.IsAvailable || p.IsOrderable || !p.IsPreviouslyBought {
+		t.Errorf("flags: available=%v orderable=%v previouslyBought=%v, want true/false/true",
+			p.IsAvailable, p.IsOrderable, p.IsPreviouslyBought)
+	}
+	if len(p.PropertyIcons) != 1 || p.PropertyIcons[0] != "vegetarisch" {
+		t.Errorf("PropertyIcons = %v", p.PropertyIcons)
+	}
+}
+
+func TestGetProductsByIDsOmitsUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mobile-services/product/search/v2/products" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.URL.Query()["ids"]; len(got) != 2 {
+			t.Errorf("ids = %v, want 2", got)
+		}
+		// The API drops id 387595 (web-only) instead of erroring.
+		json.NewEncoder(w).Encode([]productResponse{{WebshopID: 1, Title: "One", AvailableOnline: true}})
+	}))
+	defer server.Close()
+
+	products, err := New(WithBaseURL(server.URL)).GetProductsByIDs(context.Background(), []int{387595, 1})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(products) != 1 || products[0].ID != 1 || !products[0].IsAvailable {
+		t.Errorf("products = %+v, want only id 1", products)
+	}
+}
