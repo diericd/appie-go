@@ -287,7 +287,98 @@ func (c *Client) AddToOrderCheckedFrom(ctx context.Context, before *Order, items
 
 	res := diffBasketWrite(merged, after)
 	res.OrderID = orderID
+	c.markSoldOut(ctx, res)
 	return res, nil
+}
+
+// markSoldOut moves landed items that the slot cannot fill to SoldOut: the
+// order read-back lists them like any other line. A failed lookup only sets
+// AvailabilityError, because the write already happened.
+func (c *Client) markSoldOut(ctx context.Context, res *BasketWriteResult) {
+	unavailable, err := c.GetBasketUnavailable(ctx)
+	if err != nil {
+		res.AvailabilityError = err.Error()
+		return
+	}
+	soldOut := make(map[int]bool, len(unavailable))
+	for _, u := range unavailable {
+		if u.Reason == UnavailableSoldOut {
+			soldOut[u.ProductID] = true
+		}
+	}
+	landed := res.Landed[:0]
+	for _, l := range res.Landed {
+		if soldOut[l.ID] {
+			res.SoldOut = append(res.SoldOut, l.ID)
+			continue
+		}
+		landed = append(landed, l)
+	}
+	res.Landed = landed
+}
+
+// basketAvailabilityQuery reads the basket through the mobile gql gateway,
+// which, unlike the order summary and details, flags lines the slot cannot
+// fill. Field names were found by probing; introspection is disabled.
+const basketAvailabilityQuery = `query BasketAvailability {
+  basket {
+    items {
+      id
+      quantity
+      allocatedQuantity
+      product {
+        title
+        availabilityLabel
+        availability { isOrderable }
+      }
+    }
+  }
+}`
+
+type basketAvailabilityResponse struct {
+	Basket struct {
+		Items []struct {
+			ID                int  `json:"id"`
+			Quantity          int  `json:"quantity"`
+			AllocatedQuantity *int `json:"allocatedQuantity"`
+			Product           struct {
+				Title             string `json:"title"`
+				AvailabilityLabel string `json:"availabilityLabel"`
+				Availability      struct {
+					IsOrderable bool `json:"isOrderable"`
+				} `json:"availability"`
+			} `json:"product"`
+		} `json:"items"`
+	} `json:"basket"`
+}
+
+// GetBasketUnavailable returns the active basket's lines that will not be
+// delivered. A line is unavailable when its product is not orderable. A null
+// allocatedQuantity means AH kept it out of the order (store only); otherwise
+// it is in the order but sold out. Both rules match the AH app on 2026-10-28.
+func (c *Client) GetBasketUnavailable(ctx context.Context) ([]BasketUnavailable, error) {
+	var resp basketAvailabilityResponse
+	if err := c.DoGraphQL(ctx, basketAvailabilityQuery, nil, &resp); err != nil {
+		return nil, fmt.Errorf("get basket availability failed: %w", err)
+	}
+	var out []BasketUnavailable
+	for _, it := range resp.Basket.Items {
+		if it.Product.Availability.IsOrderable {
+			continue
+		}
+		reason := UnavailableSoldOut
+		if it.AllocatedQuantity == nil {
+			reason = UnavailableStoreOnly
+		}
+		out = append(out, BasketUnavailable{
+			ProductID: it.ID,
+			Title:     it.Product.Title,
+			Quantity:  it.Quantity,
+			Reason:    reason,
+			Label:     it.Product.AvailabilityLabel,
+		})
+	}
+	return out, nil
 }
 
 func (c *Client) readBack(ctx context.Context) (*Order, error) {

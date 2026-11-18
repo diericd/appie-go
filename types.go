@@ -167,9 +167,36 @@ type BasketWriteResult struct {
 	QtyMismatch []BasketQtyMismatch `json:"qty_mismatch,omitempty"`
 	// Removed lists items sent with qty 0 that are absent from the order.
 	Removed []int `json:"removed,omitempty"`
+	// SoldOut lists items that are in the order at the sent qty but that the
+	// slot cannot fill ("Tijdelijk uitverkocht"). They are not in Landed.
+	SoldOut []int `json:"sold_out,omitempty"`
+	// AvailabilityError is set when the sold-out check failed. The write and
+	// the other lists still hold, but SoldOut is unknown.
+	AvailabilityError string `json:"availability_error,omitempty"`
 	// TotalItems counts the order's distinct product lines, not units.
 	TotalItems int     `json:"total_items"`
 	TotalPrice float64 `json:"total_price"`
+}
+
+// Reasons a basket line is not delivered, as GetBasketUnavailable reports them.
+const (
+	// UnavailableStoreOnly: AH kept the line out of the order, and the app
+	// shows "Alleen in de winkel". GetOrder does not list these lines.
+	UnavailableStoreOnly = "store_only"
+	// UnavailableSoldOut: the line is in the order, but the slot cannot fill
+	// it, and the app shows "Tijdelijk uitverkocht".
+	UnavailableSoldOut = "sold_out"
+)
+
+// BasketUnavailable is a basket line that the delivery slot will not deliver.
+type BasketUnavailable struct {
+	ProductID int    `json:"product_id"`
+	Title     string `json:"name,omitempty"`
+	Quantity  int    `json:"quantity"`
+	// Reason is UnavailableStoreOnly or UnavailableSoldOut.
+	Reason string `json:"reason"`
+	// Label is AH's availabilityLabel, e.g. "Uit het assortiment". Often empty.
+	Label string `json:"label,omitempty"`
 }
 
 // BasketLine is a product ID with its quantity in the order.

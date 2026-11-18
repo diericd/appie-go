@@ -3,10 +3,12 @@ package appie
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -406,6 +408,7 @@ func TestAddToOrderChecked(t *testing.T) {
 			json.NewEncoder(w).Encode(summary(after))
 		case r.URL.Path == "/graphql" && r.Method == http.MethodPost:
 			var body struct {
+				Query     string `json:"query"`
 				Variables struct {
 					Items []map[string]int `json:"items"`
 				} `json:"variables"`
@@ -413,7 +416,9 @@ func TestAddToOrderChecked(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Errorf("decode body: %v", err)
 			}
-			sent = body.Variables.Items
+			if strings.Contains(body.Query, "basketItemsUpdate") {
+				sent = body.Variables.Items
+			}
 			json.NewEncoder(w).Encode(map[string]any{
 				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
 			})
@@ -729,5 +734,141 @@ func TestGetFulfillmentsNoFallbackOnOtherGraphQLError(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("calls = %d, want no fallback retry on an unrelated GraphQL error", calls)
+	}
+}
+
+// basketAvailabilityItem builds one basket line the way the mobile gql basket
+// query returns it. A nil allocated encodes allocatedQuantity: null.
+func basketAvailabilityItem(id, qty int, allocated *int, orderable bool, label any) map[string]any {
+	return map[string]any{
+		"id":                id,
+		"quantity":          qty,
+		"allocatedQuantity": allocated,
+		"product": map[string]any{
+			"title":             fmt.Sprintf("product %d", id),
+			"availabilityLabel": label,
+			"availability":      map[string]any{"isOrderable": orderable},
+		},
+	}
+}
+
+func TestGetBasketUnavailable(t *testing.T) {
+	zero := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query string `json:"query"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		for _, field := range []string{"basket", "allocatedQuantity", "isOrderable"} {
+			if !strings.Contains(body.Query, field) {
+				t.Errorf("basket query lacks %s", field)
+			}
+		}
+		// Shapes seen live on 2026-10-28 for "Alleen in de winkel" (null
+		// allocation) and "Tijdelijk uitverkocht" (allocated 0, not orderable).
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"basket": map[string]any{"items": []map[string]any{
+			basketAvailabilityItem(367237, 1, nil, false, "Uit het assortiment"),
+			basketAvailabilityItem(368480, 1, &zero, true, nil),
+			basketAvailabilityItem(588943, 2, &zero, false, nil),
+			basketAvailabilityItem(606837, 1, nil, false, nil),
+		}}}})
+	}))
+	defer srv.Close()
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	got, err := client.GetBasketUnavailable(context.Background())
+	if err != nil {
+		t.Fatalf("GetBasketUnavailable: %v", err)
+	}
+	want := []BasketUnavailable{
+		{ProductID: 367237, Title: "product 367237", Quantity: 1, Reason: UnavailableStoreOnly, Label: "Uit het assortiment"},
+		{ProductID: 588943, Title: "product 588943", Quantity: 2, Reason: UnavailableSoldOut},
+		{ProductID: 606837, Title: "product 606837", Quantity: 1, Reason: UnavailableStoreOnly},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("unavailable mismatch\n got: %+v\nwant: %+v", got, want)
+	}
+}
+
+// soldOutServer serves an order that holds lines, and a gql basket in which
+// soldOut lines are allocated 0 and not orderable. A non-empty basketErr makes
+// the basket query fail with that GraphQL error.
+func soldOutServer(t *testing.T, lines map[int]int, soldOut map[int]bool, basketErr string) *httptest.Server {
+	t.Helper()
+	zero := 0
+	reads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" {
+			products := make([]map[string]any, 0, len(lines))
+			if reads > 0 {
+				for id, qty := range lines {
+					products = append(products, map[string]any{"quantity": qty, "product": map[string]any{"webshopId": id}})
+				}
+			}
+			reads++
+			json.NewEncoder(w).Encode(map[string]any{"id": 777, "orderedProducts": products})
+			return
+		}
+		var body struct {
+			Query string `json:"query"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if strings.Contains(body.Query, "basketItemsUpdate") {
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
+			})
+			return
+		}
+		if basketErr != "" {
+			json.NewEncoder(w).Encode(map[string]any{"errors": []map[string]any{{"message": basketErr}}})
+			return
+		}
+		items := make([]map[string]any, 0, len(lines))
+		for id, qty := range lines {
+			items = append(items, basketAvailabilityItem(id, qty, &zero, !soldOut[id], nil))
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"basket": map[string]any{"items": items}}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestAddToOrderCheckedSoldOut(t *testing.T) {
+	noRetryDelay(t)
+	srv := soldOutServer(t, map[int]int{1: 1, 2: 2}, map[int]bool{2: true}, "")
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	res, err := client.AddToOrderChecked(context.Background(), []OrderItem{
+		{ProductID: 1, Quantity: 1},
+		{ProductID: 2, Quantity: 2},
+	})
+	if err != nil {
+		t.Fatalf("AddToOrderChecked: %v", err)
+	}
+	if !reflect.DeepEqual(res.Landed, []BasketLine{{ID: 1, Qty: 1}}) {
+		t.Errorf("Landed = %+v, want only 1", res.Landed)
+	}
+	if !reflect.DeepEqual(res.SoldOut, []int{2}) {
+		t.Errorf("SoldOut = %v, want [2]", res.SoldOut)
+	}
+	if res.AvailabilityError != "" {
+		t.Errorf("AvailabilityError = %q, want empty", res.AvailabilityError)
+	}
+}
+
+func TestAddToOrderCheckedAvailabilityLookupFails(t *testing.T) {
+	noRetryDelay(t)
+	srv := soldOutServer(t, map[int]int{1: 1}, nil, "basket unavailable")
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	res, err := client.AddToOrderChecked(context.Background(), []OrderItem{{ProductID: 1, Quantity: 1}})
+	if err != nil {
+		t.Fatalf("a failed availability lookup must not fail the write: %v", err)
+	}
+	if !reflect.DeepEqual(res.Landed, []BasketLine{{ID: 1, Qty: 1}}) || len(res.SoldOut) != 0 {
+		t.Errorf("want 1 landed and nothing sold out, got %+v", res)
+	}
+	if !strings.Contains(res.AvailabilityError, "basket unavailable") {
+		t.Errorf("AvailabilityError = %q, want the gql error", res.AvailabilityError)
 	}
 }

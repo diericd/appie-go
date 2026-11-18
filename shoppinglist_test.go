@@ -1,6 +1,7 @@
 package appie
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -197,7 +198,10 @@ func boodschappenlijstSeqServer(t *testing.T, lists []string, orderBefore, order
 		case r.URL.Path == "/mobile-services/shoppinglist/v2/items" && r.Method == http.MethodPatch:
 			*patches = append(*patches, body)
 		case r.URL.Path == "/graphql":
-			*graphql = append(*graphql, body)
+			// Only mutations count; the sold-out check after a write is a read.
+			if bytes.Contains(body, []byte("basketItemsUpdate")) {
+				*graphql = append(*graphql, body)
+			}
 			w.Write([]byte(`{"data":{}}`))
 		case r.URL.Path == "/mobile-services/order/v1/summaries/active":
 			if len(*graphql) == 0 {
