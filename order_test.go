@@ -872,3 +872,105 @@ func TestAddToOrderCheckedAvailabilityLookupFails(t *testing.T) {
 		t.Errorf("AvailabilityError = %q, want the gql error", res.AvailabilityError)
 	}
 }
+
+// webOnlyServer serves an order that lists orderLines, and a gql basket that
+// holds basket lines as given (BE web-only lines are in the basket only).
+func webOnlyServer(t *testing.T, orderLines map[int]int, basket []map[string]any) *httptest.Server {
+	t.Helper()
+	reads := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" {
+			products := make([]map[string]any, 0, len(orderLines))
+			if reads > 0 {
+				for id, qty := range orderLines {
+					products = append(products, map[string]any{"quantity": qty, "product": map[string]any{"webshopId": id}})
+				}
+			}
+			reads++
+			json.NewEncoder(w).Encode(map[string]any{"id": 777, "orderedProducts": products})
+			return
+		}
+		var body struct {
+			Query string `json:"query"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if strings.Contains(body.Query, "basketItemsUpdate") {
+			json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{"basketItemsUpdate": map[string]any{"__typename": "Basket"}},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"basket": map[string]any{"items": basket}}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestAddToOrderCheckedLandsWebOnlyLine(t *testing.T) {
+	noRetryDelay(t)
+	one, two := 1, 2
+	// 565848 (witlof) is web-only: absent from the order, allocated in the
+	// basket. 606837 is store only: null allocation.
+	srv := webOnlyServer(t, map[int]int{1: 1}, []map[string]any{
+		basketAvailabilityItem(1, 1, &one, true, nil),
+		basketAvailabilityItem(565848, 2, &two, true, "Alleen in de winkel"),
+		basketAvailabilityItem(606837, 1, nil, false, nil),
+		basketAvailabilityItem(700000, 3, &one, true, nil),
+	})
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	res, err := client.AddToOrderChecked(context.Background(), []OrderItem{
+		{ProductID: 1, Quantity: 1},
+		{ProductID: 565848, Quantity: 2},
+		{ProductID: 606837, Quantity: 1},
+		{ProductID: 700000, Quantity: 2},
+	})
+	if err != nil {
+		t.Fatalf("AddToOrderChecked: %v", err)
+	}
+	if !reflect.DeepEqual(res.Landed, []BasketLine{{ID: 1, Qty: 1}, {ID: 565848, Qty: 2}}) {
+		t.Errorf("Landed = %+v, want 1 and web-only 565848", res.Landed)
+	}
+	if !reflect.DeepEqual(res.Rejected, []int{606837}) {
+		t.Errorf("Rejected = %v, want only store-only 606837", res.Rejected)
+	}
+	if !reflect.DeepEqual(res.QtyMismatch, []BasketQtyMismatch{{ID: 700000, Want: 2, Got: 3}}) {
+		t.Errorf("QtyMismatch = %+v, want 700000 want 2 got 3", res.QtyMismatch)
+	}
+}
+
+func TestGetBasketAndWebOnlyLines(t *testing.T) {
+	two := 2
+	srv := webOnlyServer(t, nil, []map[string]any{
+		{
+			"id": 565848, "quantity": 2, "allocatedQuantity": two,
+			"product": map[string]any{
+				"title": "AH Witlof", "salesUnitSize": "500 g",
+				"price":             map[string]any{"now": map[string]any{"amount": 3.79}},
+				"availabilityLabel": "Alleen in de winkel",
+				"availability":      map[string]any{"isOrderable": true},
+			},
+		},
+		basketAvailabilityItem(1, 1, &two, true, nil),
+		basketAvailabilityItem(606837, 1, nil, false, nil),
+	})
+
+	client := New(WithBaseURL(srv.URL), WithTokens("test", "test"))
+	basket, err := client.GetBasket(context.Background())
+	if err != nil {
+		t.Fatalf("GetBasket: %v", err)
+	}
+	if len(basket) != 3 {
+		t.Fatalf("GetBasket returned %d lines, want 3", len(basket))
+	}
+
+	got := WebOnlyLines(basket, &Order{Items: []OrderItem{{ProductID: 1, Quantity: 1}}})
+	two = 2
+	want := []BasketItem{{
+		ProductID: 565848, Title: "AH Witlof", UnitSize: "500 g", Price: 3.79,
+		Quantity: 2, AllocatedQuantity: &two, Orderable: true, Label: "Alleen in de winkel",
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("WebOnlyLines mismatch\n got: %+v\nwant: %+v", got, want)
+	}
+}
