@@ -201,6 +201,25 @@ type BasketUnavailable struct {
 	Label string `json:"label,omitempty"`
 }
 
+// BasketItem is one line of the gql basket.
+type BasketItem struct {
+	ProductID int
+	Title     string
+	UnitSize  string
+	// Price is the current unit price (price.now), before any group deal.
+	Price    float64
+	Quantity int
+	// AllocatedQuantity is nil when AH keeps the line out of the order.
+	AllocatedQuantity *int
+	Orderable         bool
+	Label             string
+}
+
+// held reports whether the slot holds the line for delivery.
+func (b BasketItem) held() bool {
+	return b.Orderable && b.AllocatedQuantity != nil && *b.AllocatedQuantity > 0
+}
+
 // BasketLine is a product ID with its quantity in the order.
 type BasketLine struct {
 	ID  int `json:"id"`

@@ -287,21 +287,24 @@ func (c *Client) AddToOrderCheckedFrom(ctx context.Context, before *Order, items
 
 	res := diffBasketWrite(merged, after)
 	res.OrderID = orderID
-	c.markSoldOut(ctx, res)
+	c.reconcileWithBasket(ctx, merged, res)
 	return res, nil
 }
 
-// markSoldOut moves landed items that the slot cannot fill to SoldOut: the
-// order read-back lists them like any other line. A failed lookup only sets
+// reconcileWithBasket corrects the order read-back with the gql basket. Landed
+// items that the slot cannot fill move to SoldOut, because the order lists them
+// like any other line. Rejected items that the basket holds as allocated,
+// orderable lines (BE web-only products, which the order endpoints omit) move to
+// Landed, or to QtyMismatch at another qty. A failed lookup only sets
 // AvailabilityError, because the write already happened.
-func (c *Client) markSoldOut(ctx context.Context, res *BasketWriteResult) {
-	unavailable, err := c.GetBasketUnavailable(ctx)
+func (c *Client) reconcileWithBasket(ctx context.Context, sent []OrderItem, res *BasketWriteResult) {
+	basket, err := c.GetBasket(ctx)
 	if err != nil {
 		res.AvailabilityError = err.Error()
 		return
 	}
-	soldOut := make(map[int]bool, len(unavailable))
-	for _, u := range unavailable {
+	soldOut := make(map[int]bool)
+	for _, u := range UnavailableLines(basket) {
 		if u.Reason == UnavailableSoldOut {
 			soldOut[u.ProductID] = true
 		}
@@ -315,12 +318,40 @@ func (c *Client) markSoldOut(ctx context.Context, res *BasketWriteResult) {
 		landed = append(landed, l)
 	}
 	res.Landed = landed
+
+	if len(res.Rejected) == 0 {
+		return
+	}
+	held := make(map[int]int)
+	for _, it := range basket {
+		if it.held() {
+			held[it.ProductID] = it.Quantity
+		}
+	}
+	want := make(map[int]int, len(sent))
+	for _, it := range sent {
+		want[it.ProductID] = it.Quantity
+	}
+	rejected := res.Rejected[:0]
+	for _, id := range res.Rejected {
+		got, ok := held[id]
+		switch {
+		case !ok:
+			rejected = append(rejected, id)
+		case got == want[id]:
+			res.Landed = append(res.Landed, BasketLine{ID: id, Qty: got})
+		default:
+			res.QtyMismatch = append(res.QtyMismatch, BasketQtyMismatch{ID: id, Want: want[id], Got: got})
+		}
+	}
+	res.Rejected = rejected
 }
 
-// basketAvailabilityQuery reads the basket through the mobile gql gateway,
-// which, unlike the order summary and details, flags lines the slot cannot
-// fill. Field names were found by probing; introspection is disabled.
-const basketAvailabilityQuery = `query BasketAvailability {
+// basketQuery reads the basket through the mobile gql gateway. Unlike the order
+// summary and details it flags lines the slot cannot fill, and it lists BE
+// web-only lines that both order endpoints omit. Field names were found by
+// probing; introspection is disabled.
+const basketQuery = `query Basket {
   basket {
     items {
       id
@@ -328,6 +359,8 @@ const basketAvailabilityQuery = `query BasketAvailability {
       allocatedQuantity
       product {
         title
+        salesUnitSize
+        price { now { amount } }
         availabilityLabel
         availability { isOrderable }
       }
@@ -335,14 +368,20 @@ const basketAvailabilityQuery = `query BasketAvailability {
   }
 }`
 
-type basketAvailabilityResponse struct {
+type basketResponse struct {
 	Basket struct {
 		Items []struct {
 			ID                int  `json:"id"`
 			Quantity          int  `json:"quantity"`
 			AllocatedQuantity *int `json:"allocatedQuantity"`
 			Product           struct {
-				Title             string `json:"title"`
+				Title         string `json:"title"`
+				SalesUnitSize string `json:"salesUnitSize"`
+				Price         struct {
+					Now struct {
+						Amount float64 `json:"amount"`
+					} `json:"now"`
+				} `json:"price"`
 				AvailabilityLabel string `json:"availabilityLabel"`
 				Availability      struct {
 					IsOrderable bool `json:"isOrderable"`
@@ -352,18 +391,47 @@ type basketAvailabilityResponse struct {
 	} `json:"basket"`
 }
 
-// GetBasketUnavailable returns the active basket's lines that will not be
-// delivered. A line is unavailable when its product is not orderable. A null
-// allocatedQuantity means AH kept it out of the order (store only); otherwise
-// it is in the order but sold out. Both rules match the AH app on 2026-10-28.
-func (c *Client) GetBasketUnavailable(ctx context.Context) ([]BasketUnavailable, error) {
-	var resp basketAvailabilityResponse
-	if err := c.DoGraphQL(ctx, basketAvailabilityQuery, nil, &resp); err != nil {
-		return nil, fmt.Errorf("get basket availability failed: %w", err)
+// GetBasket returns every line of the active basket. AH returns no basket for
+// an order that is not reopened.
+func (c *Client) GetBasket(ctx context.Context) ([]BasketItem, error) {
+	var resp basketResponse
+	if err := c.DoGraphQL(ctx, basketQuery, nil, &resp); err != nil {
+		return nil, fmt.Errorf("get basket failed: %w", err)
 	}
-	var out []BasketUnavailable
+	out := make([]BasketItem, 0, len(resp.Basket.Items))
 	for _, it := range resp.Basket.Items {
-		if it.Product.Availability.IsOrderable {
+		out = append(out, BasketItem{
+			ProductID:         it.ID,
+			Title:             it.Product.Title,
+			UnitSize:          it.Product.SalesUnitSize,
+			Price:             it.Product.Price.Now.Amount,
+			Quantity:          it.Quantity,
+			AllocatedQuantity: it.AllocatedQuantity,
+			Orderable:         it.Product.Availability.IsOrderable,
+			Label:             it.Product.AvailabilityLabel,
+		})
+	}
+	return out, nil
+}
+
+// GetBasketUnavailable returns the active basket's lines that will not be
+// delivered, as UnavailableLines judges them.
+func (c *Client) GetBasketUnavailable(ctx context.Context) ([]BasketUnavailable, error) {
+	basket, err := c.GetBasket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return UnavailableLines(basket), nil
+}
+
+// UnavailableLines returns the basket lines that will not be delivered. A line
+// is unavailable when its product is not orderable. A null allocatedQuantity
+// means AH kept it out of the order (store only); otherwise it is in the order
+// but sold out. Both rules match the AH app on 2026-10-28.
+func UnavailableLines(basket []BasketItem) []BasketUnavailable {
+	var out []BasketUnavailable
+	for _, it := range basket {
+		if it.Orderable {
 			continue
 		}
 		reason := UnavailableSoldOut
@@ -371,14 +439,32 @@ func (c *Client) GetBasketUnavailable(ctx context.Context) ([]BasketUnavailable,
 			reason = UnavailableStoreOnly
 		}
 		out = append(out, BasketUnavailable{
-			ProductID: it.ID,
-			Title:     it.Product.Title,
+			ProductID: it.ProductID,
+			Title:     it.Title,
 			Quantity:  it.Quantity,
 			Reason:    reason,
-			Label:     it.Product.AvailabilityLabel,
+			Label:     it.Label,
 		})
 	}
-	return out, nil
+	return out
+}
+
+// WebOnlyLines returns the basket lines that will be delivered but that the
+// order o does not list. On ah.be these are web-only products (wiNNNNNN ids
+// absent from the mobile catalog); their price still counts in the order
+// total. Seen live on 2026-11-18: witlof 565848, allocated 2, orderable.
+func WebOnlyLines(basket []BasketItem, o *Order) []BasketItem {
+	inOrder := make(map[int]bool, len(o.Items))
+	for _, it := range o.Items {
+		inOrder[it.ProductID] = true
+	}
+	var out []BasketItem
+	for _, it := range basket {
+		if it.held() && !inOrder[it.ProductID] {
+			out = append(out, it)
+		}
+	}
+	return out
 }
 
 func (c *Client) readBack(ctx context.Context) (*Order, error) {
