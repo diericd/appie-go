@@ -74,6 +74,12 @@ type Product struct {
 	BonusSegmentID string `json:"bonusSegmentId,omitempty"`
 	// SelfAdd is the "Zelf toevoegen" text of a meal kit (what to buy extra).
 	SelfAdd string `json:"selfAdd,omitempty"`
+	// WebPath is the website path, e.g. "/producten/product/wi565848/ah-witlof".
+	// Only GetProductGQL fills it.
+	WebPath string `json:"webPath,omitempty"`
+	// InAssortment reports whether the product is in the account's (BE)
+	// assortment. Nil when unknown; set by GetProductGQL and InAssortment.
+	InAssortment *bool `json:"inAssortment,omitempty"`
 }
 
 // Price represents product pricing in EUR.
