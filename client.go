@@ -37,6 +37,7 @@ type Client struct {
 	userAgent     string
 	clientID      string
 	clientVersion string
+	locale        string // x-locale for gql product search; see WithLocale
 
 	mu           sync.RWMutex
 	accessToken  string
@@ -78,6 +79,15 @@ func WithBaseURL(url string) Option {
 func WithClientID(id string) Option {
 	return func(c *Client) {
 		c.clientID = id
+	}
+}
+
+// WithLocale sets the x-locale header sent with gql product search. "nl_BE"
+// makes productSearch return the Belgian webshop list, BE-only products
+// included, as www.ah.be does. The REST search ignores the header.
+func WithLocale(locale string) Option {
+	return func(c *Client) {
+		c.locale = locale
 	}
 }
 
@@ -270,6 +280,9 @@ func (c *Client) setHeaders(req *http.Request) {
 	req.Header.Set("x-application", "AHWEBSHOP")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	if loc, _ := req.Context().Value(localeKey{}).(string); loc != "" {
+		req.Header.Set("x-locale", loc)
+	}
 
 	c.mu.RLock()
 	if c.accessToken != "" {
