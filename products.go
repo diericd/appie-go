@@ -216,13 +216,21 @@ type SearchOptions struct {
 	Bonus bool   // Only return products currently on bonus/promotion
 }
 
-// SearchProductsFiltered searches for products using the REST API.
+// SearchProductsFiltered searches for products. With WithLocale set it takes
+// the result list from the gql search in that locale, else from the REST API.
 // When Bonus is true, over-fetches and filters client-side to return
 // up to Limit bonus products.
 func (c *Client) SearchProductsFiltered(ctx context.Context, opts SearchOptions) ([]Product, error) {
 	limit := opts.Limit
 	if limit <= 0 {
 		limit = 30
+	}
+	if c.locale != "" {
+		products, err := c.searchProductsLocale(ctx, opts, limit)
+		if err == nil {
+			return products, nil
+		}
+		c.logger.Printf("locale search failed, falling back to REST: %v", err)
 	}
 
 	var products []Product
@@ -293,5 +301,79 @@ func (c *Client) GetProductsByIDs(ctx context.Context, productIDs []int) ([]Prod
 		products = append(products, p.toProduct())
 	}
 
+	return products, nil
+}
+
+// localeKey carries the x-locale value from a call to setHeaders.
+type localeKey struct{}
+
+// maxLocalePages bounds the paging of a bonus-filtered locale search.
+const maxLocalePages = 10
+
+const productSearchQuery = `query ProductSearch($input: ProductSearchInput!) { productSearch(input: $input) { products { id } } }`
+
+// searchProductsLocale runs the gql productSearch with x-locale, which on
+// api.ah.be returns the same list as the www.ah.be search (BE-only products
+// included). The gql result has ids only, so details come from the REST by-id
+// endpoint; ids it does not know (BE-only) come from GetProductGQL, and ids
+// that resolve nowhere are left out.
+func (c *Client) searchProductsLocale(ctx context.Context, opts SearchOptions, limit int) ([]Product, error) {
+	pageSize := limit
+	if opts.Bonus {
+		pageSize = min(limit*5, 150)
+	}
+	gqlCtx := context.WithValue(ctx, localeKey{}, c.locale)
+
+	var products []Product
+	for page := 0; page < maxLocalePages && len(products) < limit; page++ {
+		var resp struct {
+			ProductSearch struct {
+				Products []struct {
+					ID int `json:"id"`
+				} `json:"products"`
+			} `json:"productSearch"`
+		}
+		input := map[string]any{"query": opts.Query, "page": page, "size": pageSize}
+		if err := c.DoGraphQL(gqlCtx, productSearchQuery, map[string]any{"input": input}, &resp); err != nil {
+			return nil, fmt.Errorf("gql product search failed: %w", err)
+		}
+		ids := make([]int, 0, len(resp.ProductSearch.Products))
+		for _, p := range resp.ProductSearch.Products {
+			ids = append(ids, p.ID)
+		}
+		if len(ids) == 0 {
+			break
+		}
+
+		rest, err := c.GetProductsByIDs(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		byID := make(map[int]Product, len(rest))
+		for _, p := range rest {
+			byID[p.ID] = p
+		}
+		for _, id := range ids {
+			p, ok := byID[id]
+			if !ok {
+				gp, err := c.GetProductGQL(ctx, id)
+				if err != nil {
+					c.logger.Printf("locale search: skip %d: %v", id, err)
+					continue
+				}
+				p = *gp
+			}
+			if opts.Bonus && !p.IsBonus {
+				continue
+			}
+			products = append(products, p)
+			if len(products) >= limit {
+				break
+			}
+		}
+		if len(ids) < pageSize {
+			break
+		}
+	}
 	return products, nil
 }
